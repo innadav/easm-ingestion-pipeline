@@ -6,6 +6,7 @@ from discovery_scheduler import app as scheduler
 from probe_worker.worker import NetworkProbeEngine
 from pydantic import ValidationError
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     ArrayType,
     BooleanType,
@@ -133,7 +134,8 @@ def test_graph_clustering_prunes_shared_cdn_hubs(
             "app1.acme.com",
             ["10.20.30.40"],
             ["internal-alb.elb.amazonaws.com"],
-            None,
+            "shared-cert",
+            ["app1.acme.com", "app2.acme.com"],
             False,
             "2026-11-27T10:00:00Z",
         ),
@@ -142,7 +144,8 @@ def test_graph_clustering_prunes_shared_cdn_hubs(
             "app2.acme.com",
             ["10.20.30.40"],
             ["internal-alb.elb.amazonaws.com"],
-            None,
+            "shared-cert",
+            ["app1.acme.com", "app2.acme.com"],
             False,
             "2026-11-27T10:00:00Z",
         ),
@@ -152,6 +155,7 @@ def test_graph_clustering_prunes_shared_cdn_hubs(
             ["104.16.132.229"],
             ["www.acme.com.cdn.cloudflare.net"],
             None,
+            [],
             True,
             "2026-11-27T10:00:00Z",
         ),
@@ -163,16 +167,17 @@ def test_graph_clustering_prunes_shared_cdn_hubs(
             StructField("a_records", ArrayType(StringType()), False),
             StructField("cname_chain", ArrayType(StringType()), False),
             StructField("cert_sha256", StringType(), True),
+            StructField("cert_sans", ArrayType(StringType()), False),
             StructField("is_shared_cdn", BooleanType(), False),
             StructField("observed_at", StringType(), False),
         ]
     )
     silver_df = spark.createDataFrame(rows, schema)
+    edges = extract_infrastructure_edges(silver_df)
+    assert edges.filter(F.col("relation") == "COVERS_SAN").count() == 4
     clusters = {
         row["fqdn"]: (row["cluster_id"], row["root_cause_node"])
-        for row in resolve_clusters_and_root_causes(
-            extract_infrastructure_edges(silver_df)
-        ).collect()
+        for row in resolve_clusters_and_root_causes(edges).collect()
     }
 
     assert clusters["app1.acme.com"][0] == clusters["app2.acme.com"][0]

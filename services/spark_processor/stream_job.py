@@ -152,10 +152,28 @@ def _merge_delta_findings(
             source_states.alias("source"),
             "target.asset_id = source.asset_id AND target.source = source.source",
         )
-        .whenMatchedDelete()
+        .whenMatchedDelete(condition="source.has_finding = false")
+        .whenMatchedUpdate(
+            condition="source.has_finding = true",
+            set={
+                "exposure_type": F.col("source.exposure_type"),
+                "validation_tier": F.col("source.validation_tier"),
+                "detected_at": F.col("source.detected_at"),
+            },
+        )
+        .whenNotMatchedInsert(
+            condition="source.has_finding = true",
+            values={
+                "asset_id": F.col("source.asset_id"),
+                "tenant_id": F.col("source.tenant_id"),
+                "source": F.col("source.source"),
+                "exposure_type": F.col("source.exposure_type"),
+                "validation_tier": F.col("source.validation_tier"),
+                "detected_at": F.col("source.detected_at"),
+            },
+        )
         .execute()
     )
-    current_findings.write.format("delta").mode("append").save(findings_path)
     return spark.read.format("delta").load(findings_path)
 
 
@@ -294,10 +312,10 @@ def _upsert_gold_assets(spark: SparkSession, aggregated: DataFrame, gold_assets_
 
 
 def _upsert_delta_edges(spark: SparkSession, edges: DataFrame, edges_path: str) -> None:
-    if edges.isEmpty():
-        return
     if not DeltaTable.isDeltaTable(spark, edges_path):
         edges.write.format("delta").mode("overwrite").save(edges_path)
+        return
+    if edges.isEmpty():
         return
     (
         DeltaTable.forPath(spark, edges_path)
@@ -312,6 +330,52 @@ def _upsert_delta_edges(spark: SparkSession, edges: DataFrame, edges_path: str) 
         .whenNotMatchedInsertAll()
         .execute()
     )
+
+
+def _sync_delta_clusters(
+    spark: SparkSession,
+    clusters: DataFrame,
+    touched_tenants: DataFrame,
+    gold_assets_path: str,
+) -> DataFrame:
+    cluster_assignments = (
+        spark.read.format("delta")
+        .load(gold_assets_path)
+        .join(touched_tenants, on="tenant_id", how="inner")
+        .select("asset_id", "tenant_id", "fqdn")
+        .join(
+            clusters.select("tenant_id", "fqdn", "cluster_id", "root_cause_node"),
+            on=["tenant_id", "fqdn"],
+            how="left",
+        )
+        .withColumn(
+            "cluster_id",
+            F.coalesce(F.col("cluster_id"), F.concat(F.lit("fqdn:"), F.col("fqdn"))),
+        )
+        .withColumn(
+            "root_cause_node",
+            F.coalesce(
+                F.col("root_cause_node"),
+                F.concat(F.lit("fqdn:"), F.col("fqdn")),
+            ),
+        )
+    )
+    (
+        DeltaTable.forPath(spark, gold_assets_path)
+        .alias("target")
+        .merge(
+            cluster_assignments.alias("source"),
+            "target.asset_id = source.asset_id",
+        )
+        .whenMatchedUpdate(
+            set={
+                "cluster_id": F.col("source.cluster_id"),
+                "root_cause_node": F.col("source.root_cause_node"),
+            }
+        )
+        .execute()
+    )
+    return cluster_assignments
 
 
 def _append_state_changes(spark: SparkSession, aggregated: DataFrame, history_path: str) -> None:
@@ -364,61 +428,103 @@ def _append_state_changes(spark: SparkSession, aggregated: DataFrame, history_pa
     changes.write.format("delta").mode("append").save(history_path)
 
 
+def _prepare_postgres_tables(spark: SparkSession) -> None:
+    connection = spark._jvm.java.sql.DriverManager.getConnection(PG_JDBC_URL, PG_USER, PG_PASSWORD)
+    try:
+        statement = connection.createStatement()
+        try:
+            statement.execute(
+                """
+                CREATE UNLOGGED TABLE IF NOT EXISTS gold_assets_staging (
+                    asset_id TEXT, tenant_id TEXT, fqdn TEXT,
+                    cluster_id TEXT, root_cause_node TEXT,
+                    latest_ips_json TEXT, is_shared_cdn BOOLEAN,
+                    detected_tech_json TEXT, tls_version TEXT,
+                    cert_sha256 TEXT, status TEXT, exposure_type TEXT,
+                    validation_tier TEXT, last_seen TEXT
+                );
+                CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_findings_staging (
+                    asset_id TEXT, tenant_id TEXT, source TEXT,
+                    exposure_type TEXT, validation_tier TEXT, detected_at TEXT
+                );
+                CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_sources_staging (
+                    asset_id TEXT, source TEXT, has_finding BOOLEAN
+                );
+                CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_edges_staging (
+                    edge_id TEXT, tenant_id TEXT, src_node TEXT,
+                    relation TEXT, dst_node TEXT,
+                    is_shared_infra BOOLEAN, observed_at TEXT
+                );
+                CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_clusters_staging (
+                    asset_id TEXT, tenant_id TEXT, fqdn TEXT,
+                    cluster_id TEXT, root_cause_node TEXT
+                )
+                """
+            )
+        finally:
+            statement.close()
+    finally:
+        connection.close()
+
+
 def _sync_postgres(
     spark: SparkSession,
     aggregated: DataFrame,
     source_states: DataFrame,
     edges: DataFrame,
+    cluster_assignments: DataFrame,
 ) -> None:
-    postgres_frame = aggregated.select(
-        "asset_id",
-        "tenant_id",
-        "fqdn",
-        "cluster_id",
-        "root_cause_node",
-        F.to_json("latest_ips").alias("latest_ips_json"),
-        "is_shared_cdn",
-        F.to_json("detected_tech").alias("detected_tech_json"),
-        "tls_version",
-        "cert_sha256",
-        "status",
-        "exposure_type",
-        "validation_tier",
-        "last_seen",
+    _prepare_postgres_tables(spark)
+    frames = (
+        (
+            aggregated.select(
+                "asset_id",
+                "tenant_id",
+                "fqdn",
+                "cluster_id",
+                "root_cause_node",
+                F.to_json("latest_ips").alias("latest_ips_json"),
+                "is_shared_cdn",
+                F.to_json("detected_tech").alias("detected_tech_json"),
+                "tls_version",
+                "cert_sha256",
+                "status",
+                "exposure_type",
+                "validation_tier",
+                "last_seen",
+            ),
+            "gold_assets_staging",
+        ),
+        (
+            source_states.filter(F.col("has_finding")).select(
+                "asset_id",
+                "tenant_id",
+                "source",
+                "exposure_type",
+                "validation_tier",
+                "detected_at",
+            ),
+            "gold_asset_findings_staging",
+        ),
+        (
+            source_states.select("asset_id", "source", "has_finding"),
+            "gold_asset_sources_staging",
+        ),
+        (
+            edges.select(
+                "edge_id",
+                "tenant_id",
+                "src_node",
+                "relation",
+                "dst_node",
+                "is_shared_infra",
+                "observed_at",
+            ),
+            "gold_asset_edges_staging",
+        ),
+        (cluster_assignments, "gold_asset_clusters_staging"),
     )
-    (
-        postgres_frame.write.format("jdbc")
-        .option("url", PG_JDBC_URL)
-        .option("dbtable", "gold_assets_staging")
-        .option("user", PG_USER)
-        .option("password", PG_PASSWORD)
-        .option("driver", "org.postgresql.Driver")
-        .mode("overwrite")
-        .save()
-    )
-    findings_frame = source_states.filter(F.col("has_finding")).select(
-        "asset_id",
-        "tenant_id",
-        "source",
-        "exposure_type",
-        "validation_tier",
-        F.col("detected_at"),
-    )
-    source_state_frame = source_states.select("asset_id", "source", "has_finding")
-    edge_frame = edges.select(
-        "edge_id",
-        "tenant_id",
-        "src_node",
-        "relation",
-        "dst_node",
-        "is_shared_infra",
-        "observed_at",
-    )
-    for frame, table in (
-        (findings_frame, "gold_asset_findings_staging"),
-        (source_state_frame, "gold_asset_sources_staging"),
-        (edge_frame, "gold_asset_edges_staging"),
-    ):
+    for frame, table in frames:
         (
             frame.write.format("jdbc")
             .option("url", PG_JDBC_URL)
@@ -426,61 +532,16 @@ def _sync_postgres(
             .option("user", PG_USER)
             .option("password", PG_PASSWORD)
             .option("driver", "org.postgresql.Driver")
+            .option("truncate", "true")
             .mode("overwrite")
             .save()
         )
+
     connection = spark._jvm.java.sql.DriverManager.getConnection(PG_JDBC_URL, PG_USER, PG_PASSWORD)
     connection.setAutoCommit(False)
     try:
         statement = connection.createStatement()
         try:
-            statement.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gold_assets (
-                    asset_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    fqdn TEXT NOT NULL,
-                    cluster_id TEXT,
-                    root_cause_node TEXT,
-                    latest_ips_json TEXT NOT NULL,
-                    is_shared_cdn BOOLEAN NOT NULL,
-                    detected_tech_json TEXT NOT NULL,
-                    tls_version TEXT,
-                    cert_sha256 TEXT,
-                    status TEXT NOT NULL,
-                    exposure_type TEXT,
-                    validation_tier TEXT NOT NULL,
-                    first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
-                )
-                """
-            )
-            statement.execute("ALTER TABLE gold_assets ADD COLUMN IF NOT EXISTS cluster_id TEXT")
-            statement.execute(
-                "ALTER TABLE gold_assets ADD COLUMN IF NOT EXISTS root_cause_node TEXT"
-            )
-            statement.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gold_asset_findings (
-                    asset_id TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    exposure_type TEXT NOT NULL,
-                    validation_tier TEXT NOT NULL,
-                    detected_at TEXT NOT NULL,
-                    PRIMARY KEY (asset_id, source, exposure_type)
-                );
-                CREATE TABLE IF NOT EXISTS gold_asset_edges (
-                    edge_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    src_node TEXT NOT NULL,
-                    relation TEXT NOT NULL,
-                    dst_node TEXT NOT NULL,
-                    is_shared_infra BOOLEAN NOT NULL DEFAULT FALSE,
-                    observed_at TEXT NOT NULL
-                )
-                """
-            )
             statement.execute(
                 """
                 DELETE FROM gold_asset_findings existing
@@ -510,25 +571,24 @@ def _sync_postgres(
                 FROM gold_asset_edges_staging
                 ON CONFLICT (edge_id) DO UPDATE SET
                     is_shared_infra = EXCLUDED.is_shared_infra,
-                    observed_at = EXCLUDED.observed_at
-                """
-            )
-            statement.execute(
-                """
+                    observed_at = EXCLUDED.observed_at;
+
                 INSERT INTO gold_assets (
                     asset_id, tenant_id, fqdn, cluster_id, root_cause_node,
-                    latest_ips_json, is_shared_cdn,
-                    detected_tech_json, tls_version, cert_sha256, status,
-                    exposure_type, validation_tier, first_seen, last_seen
+                    latest_ips_json, is_shared_cdn, detected_tech_json,
+                    tls_version, cert_sha256, status, exposure_type,
+                    validation_tier, first_seen, last_seen
                 )
                 SELECT
                     asset_id, tenant_id, fqdn, cluster_id, root_cause_node,
-                    latest_ips_json, is_shared_cdn,
-                    detected_tech_json, tls_version, cert_sha256, status,
-                    exposure_type, validation_tier, last_seen, last_seen
+                    latest_ips_json, is_shared_cdn, detected_tech_json,
+                    tls_version, cert_sha256, status, exposure_type,
+                    validation_tier, last_seen, last_seen
                 FROM gold_assets_staging
                 ON CONFLICT (asset_id) DO UPDATE SET
-                    cluster_id = COALESCE(EXCLUDED.cluster_id, gold_assets.cluster_id),
+                    cluster_id = COALESCE(
+                        EXCLUDED.cluster_id, gold_assets.cluster_id
+                    ),
                     root_cause_node = COALESCE(
                         EXCLUDED.root_cause_node, gold_assets.root_cause_node
                     ),
@@ -552,7 +612,14 @@ def _sync_postgres(
                     status = EXCLUDED.status,
                     exposure_type = EXCLUDED.exposure_type,
                     validation_tier = EXCLUDED.validation_tier,
-                    last_seen = EXCLUDED.last_seen
+                    last_seen = EXCLUDED.last_seen;
+
+                UPDATE gold_assets current_asset
+                SET
+                    cluster_id = incoming.cluster_id,
+                    root_cause_node = incoming.root_cause_node
+                FROM gold_asset_clusters_staging incoming
+                WHERE current_asset.asset_id = incoming.asset_id
                 """
             )
             statement.execute(
@@ -596,6 +663,9 @@ def _sync_postgres(
                 """
             )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             statement.close()
     finally:
@@ -612,19 +682,39 @@ def process_silver_microbatch(silver_df: DataFrame, batch_id: int) -> None:
     gold_findings_path = f"{LAKEHOUSE_PATH}/gold/findings"
     gold_edges_path = f"{LAKEHOUSE_PATH}/gold/infrastructure_edges"
 
-    silver_df.write.format("delta").mode("append").save(silver_path)
-    aggregated = _aggregate_asset_batch(silver_df)
-    source_states = _source_finding_states(silver_df)
-    findings = _merge_delta_findings(spark, source_states, gold_findings_path)
-    aggregated = _apply_effective_findings(aggregated, findings)
-    edges = extract_infrastructure_edges(silver_df)
-    clusters = resolve_clusters_and_root_causes(edges)
-    aggregated = _merge_graph_attributes(aggregated, clusters)
-    _upsert_delta_edges(spark, edges, gold_edges_path)
-    _upsert_gold_assets(spark, aggregated, gold_assets_path)
-    _append_state_changes(spark, aggregated, gold_history_path)
-    _sync_postgres(spark, aggregated, source_states, edges)
-    spark.sparkContext.setJobDescription(f"EASM micro-batch {batch_id} complete")
+    cached_silver = silver_df.persist()
+    try:
+        cached_silver.write.format("delta").mode("append").save(silver_path)
+        aggregated = _aggregate_asset_batch(cached_silver)
+        source_states = _source_finding_states(cached_silver)
+        findings = _merge_delta_findings(spark, source_states, gold_findings_path)
+        aggregated = _apply_effective_findings(aggregated, findings)
+
+        batch_edges = extract_infrastructure_edges(cached_silver)
+        _upsert_delta_edges(spark, batch_edges, gold_edges_path)
+        touched_tenants = cached_silver.select("tenant_id").distinct()
+        tenant_edges = (
+            spark.read.format("delta")
+            .load(gold_edges_path)
+            .join(touched_tenants, on="tenant_id", how="inner")
+        )
+        clusters = resolve_clusters_and_root_causes(tenant_edges)
+        aggregated = _merge_graph_attributes(aggregated, clusters)
+        _upsert_gold_assets(spark, aggregated, gold_assets_path)
+        cluster_assignments = _sync_delta_clusters(
+            spark, clusters, touched_tenants, gold_assets_path
+        )
+        _append_state_changes(spark, aggregated, gold_history_path)
+        _sync_postgres(
+            spark,
+            aggregated,
+            source_states,
+            batch_edges,
+            cluster_assignments,
+        )
+        spark.sparkContext.setJobDescription(f"EASM micro-batch {batch_id} complete")
+    finally:
+        cached_silver.unpersist()
 
 
 def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
@@ -647,6 +737,7 @@ def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
         .withColumn("detected_tech", F.col("payload.detected_tech"))
         .withColumn("tls_version", F.col("payload.tls_version"))
         .withColumn("cert_sha256", F.col("payload.cert_sha256"))
+        .withColumn("cert_sans", F.col("payload.cert_sans"))
         .withColumn(
             "exposure_type",
             F.when(
@@ -678,6 +769,7 @@ def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
             "detected_tech",
             "tls_version",
             "cert_sha256",
+            "cert_sans",
             "exposure_type",
             "validation_tier",
             F.col("collected_at").alias("observed_at"),

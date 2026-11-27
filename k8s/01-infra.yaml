@@ -47,6 +47,28 @@ data:
         is_shared_infra BOOLEAN NOT NULL DEFAULT FALSE,
         observed_at TEXT NOT NULL
     );
+
+    CREATE UNLOGGED TABLE IF NOT EXISTS gold_assets_staging (
+        asset_id TEXT, tenant_id TEXT, fqdn TEXT, cluster_id TEXT,
+        root_cause_node TEXT, latest_ips_json TEXT, is_shared_cdn BOOLEAN,
+        detected_tech_json TEXT, tls_version TEXT, cert_sha256 TEXT,
+        status TEXT, exposure_type TEXT, validation_tier TEXT, last_seen TEXT
+    );
+    CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_findings_staging (
+        asset_id TEXT, tenant_id TEXT, source TEXT, exposure_type TEXT,
+        validation_tier TEXT, detected_at TEXT
+    );
+    CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_sources_staging (
+        asset_id TEXT, source TEXT, has_finding BOOLEAN
+    );
+    CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_edges_staging (
+        edge_id TEXT, tenant_id TEXT, src_node TEXT, relation TEXT,
+        dst_node TEXT, is_shared_infra BOOLEAN, observed_at TEXT
+    );
+    CREATE UNLOGGED TABLE IF NOT EXISTS gold_asset_clusters_staging (
+        asset_id TEXT, tenant_id TEXT, fqdn TEXT, cluster_id TEXT,
+        root_cause_node TEXT
+    );
 ---
 apiVersion: apps/v1
 kind: Deployment

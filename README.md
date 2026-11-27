@@ -25,11 +25,13 @@ Topics:
 | `easm.raw.observations` | Probe workers | Spark processor | `tenant_id:fqdn` |
 | `easm.dlq.errors` | Workers / Spark | Monitoring / replay | Event key |
 
-Graph entity resolution links FQDNs to IPs, CNAME targets, and certificate
-fingerprints. Shared-CDN edges and high-degree hubs are pruned before connected
-component analysis; the resulting cluster and root-cause node are stored with
-each Gold asset. Findings are tracked per source so one clean probe cannot erase
-an unresolved finding reported by another protocol.
+Graph entity resolution links FQDNs to IPs, CNAME targets, certificate
+fingerprints, and certificate SANs. Each micro-batch merges new edges before
+clustering the full accumulated subgraph for affected tenants. Shared-CDN edges
+and high-degree hubs are pruned before connected-component analysis; updated
+cluster and root-cause assignments propagate to previously ingested assets.
+Findings are tracked per source so one clean probe cannot erase an unresolved
+finding reported by another protocol.
 
 ## Local Kubernetes
 
