@@ -1,8 +1,31 @@
+import shutil
+import subprocess
+
 import pytest
 from discovery_scheduler import app as scheduler
 from probe_worker.worker import NetworkProbeEngine
 from pydantic import ValidationError
+from pyspark.sql import SparkSession
 from shared.models import DiscoveryTask
+
+
+@pytest.fixture(scope="session")
+def spark() -> SparkSession:
+    java = shutil.which("java")
+    if (
+        java is None
+        or subprocess.run([java, "-version"], capture_output=True, check=False).returncode != 0
+    ):
+        pytest.skip("Java 17+ is required for Spark graph tests")
+    session = (
+        SparkSession.builder.master("local[2]")
+        .appName("easm-platform-tests")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
 
 
 class NoopLimiter:
@@ -87,3 +110,62 @@ async def test_offline_tls_probe_marks_shared_cdn() -> None:
     assert envelope.source == "tls_http_probe"
     assert envelope.payload["is_shared_cdn"] is True
     assert envelope.payload["tls_version"] == "TLSv1.3"
+
+
+def test_graph_clustering_prunes_shared_cdn_hubs(
+    spark: SparkSession,
+) -> None:
+    from spark_processor.graph_resolution import (
+        extract_infrastructure_edges,
+        resolve_clusters_and_root_causes,
+    )
+
+    rows = [
+        (
+            "t1",
+            "app1.acme.com",
+            ["10.20.30.40"],
+            ["internal-alb.elb.amazonaws.com"],
+            None,
+            False,
+            "2026-11-27T10:00:00Z",
+        ),
+        (
+            "t1",
+            "app2.acme.com",
+            ["10.20.30.40"],
+            ["internal-alb.elb.amazonaws.com"],
+            None,
+            False,
+            "2026-11-27T10:00:00Z",
+        ),
+        (
+            "t1",
+            "www.acme.com",
+            ["104.16.132.229"],
+            ["www.acme.com.cdn.cloudflare.net"],
+            None,
+            True,
+            "2026-11-27T10:00:00Z",
+        ),
+    ]
+    columns = [
+        "tenant_id",
+        "fqdn",
+        "a_records",
+        "cname_chain",
+        "cert_sha256",
+        "is_shared_cdn",
+        "observed_at",
+    ]
+    silver_df = spark.createDataFrame(rows, columns)
+    clusters = {
+        row["fqdn"]: (row["cluster_id"], row["root_cause_node"])
+        for row in resolve_clusters_and_root_causes(
+            extract_infrastructure_edges(silver_df)
+        ).collect()
+    }
+
+    assert clusters["app1.acme.com"][0] == clusters["app2.acme.com"][0]
+    assert clusters["app1.acme.com"][1] == "fqdn:internal-alb.elb.amazonaws.com"
+    assert "www.acme.com" not in clusters

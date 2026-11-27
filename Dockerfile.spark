@@ -1,10 +1,13 @@
 FROM apache/spark:4.0.1-python3
 
 USER root
-COPY services/spark_processor/stream_job.py /opt/spark/work-dir/stream_job.py
+RUN mkdir -p /opt/spark/.ivy2 \
+    && chown -R 185:185 /opt/spark/.ivy2 /opt/spark/work-dir
+COPY --chown=185:185 services/spark_processor /opt/spark/work-dir/spark_processor
+ENV PYTHONPATH=/opt/spark/work-dir
 
+USER 185
 RUN /opt/spark/bin/spark-submit \
+    --conf spark.jars.ivy=/opt/spark/.ivy2 \
     --packages io.delta:delta-spark_2.13:4.0.1,org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.postgresql:postgresql:42.7.4 \
     --version
-
-USER spark

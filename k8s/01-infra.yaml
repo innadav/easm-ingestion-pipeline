@@ -1,3 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: easm
+data:
+  01-schema.sql: |
+    CREATE TABLE IF NOT EXISTS gold_assets (
+        asset_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        fqdn TEXT NOT NULL,
+        cluster_id TEXT,
+        root_cause_node TEXT,
+        latest_ips_json TEXT NOT NULL,
+        is_shared_cdn BOOLEAN NOT NULL DEFAULT FALSE,
+        detected_tech_json TEXT NOT NULL,
+        tls_version TEXT,
+        cert_sha256 TEXT,
+        status TEXT NOT NULL,
+        exposure_type TEXT,
+        validation_tier TEXT NOT NULL,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_gold_assets_tenant_status
+        ON gold_assets (tenant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_gold_assets_cluster
+        ON gold_assets (tenant_id, cluster_id);
+
+    CREATE TABLE IF NOT EXISTS gold_asset_findings (
+        asset_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        exposure_type TEXT NOT NULL,
+        validation_tier TEXT NOT NULL,
+        detected_at TEXT NOT NULL,
+        PRIMARY KEY (asset_id, source, exposure_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS gold_asset_edges (
+        edge_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        src_node TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        dst_node TEXT NOT NULL,
+        is_shared_infra BOOLEAN NOT NULL DEFAULT FALSE,
+        observed_at TEXT NOT NULL
+    );
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -103,6 +153,14 @@ spec:
               value: easm_pass
           ports:
             - containerPort: 5432
+          volumeMounts:
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
 ---
 apiVersion: v1
 kind: Service

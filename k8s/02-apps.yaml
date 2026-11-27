@@ -65,6 +65,8 @@ spec:
           env:
             - name: OFFLINE_MODE
               value: "true"
+            - name: PROBE_CONCURRENCY
+              value: "8"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -131,8 +133,9 @@ spec:
           command:
             - /opt/spark/bin/spark-submit
             - --master=local[2]
+            - --conf=spark.jars.ivy=/opt/spark/.ivy2
             - --packages=io.delta:delta-spark_2.13:4.0.1,org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.postgresql:postgresql:42.7.4
-            - /opt/spark/work-dir/stream_job.py
+            - /opt/spark/work-dir/spark_processor/stream_job.py
           volumeMounts:
             - name: lakehouse
               mountPath: /mnt/lakehouse

@@ -13,8 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,spark]"
       - name: Lint with Ruff
         run: ruff check services tests
       - name: Run Pytest

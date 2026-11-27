@@ -14,7 +14,8 @@ containerized services backed by Redpanda, Redis, Delta Lake, and PostgreSQL.
 3. **Spark Structured Streaming** routes malformed events to the DLQ, appends
    immutable Bronze records, normalizes Silver observations, maintains Delta Gold
    state with SCD Type 2 history, and upserts PostgreSQL.
-4. **Asset API** serves tenant inventories and risk filters from PostgreSQL.
+4. **Asset API** serves tenant inventories, source-specific findings, and
+   graph-based blast-radius clusters from PostgreSQL.
 
 Topics:
 
@@ -23,6 +24,12 @@ Topics:
 | `easm.discovery.tasks` | Discovery scheduler | Probe workers | `tenant_id:fqdn` |
 | `easm.raw.observations` | Probe workers | Spark processor | `tenant_id:fqdn` |
 | `easm.dlq.errors` | Workers / Spark | Monitoring / replay | Event key |
+
+Graph entity resolution links FQDNs to IPs, CNAME targets, and certificate
+fingerprints. Shared-CDN edges and high-degree hubs are pruned before connected
+component analysis; the resulting cluster and root-cause node are stored with
+each Gold asset. Findings are tracked per source so one clean probe cannot erase
+an unresolved finding reported by another protocol.
 
 ## Local Kubernetes
 
@@ -47,6 +54,7 @@ Read operational state:
 ```bash
 kubectl port-forward -n easm svc/asset-api 8080:8080
 curl "http://localhost:8080/tenants/tenant_beta/assets?status=exposed"
+curl "http://localhost:8080/tenants/tenant_beta/clusters"
 ```
 
 Inspect streaming data and stop the cluster:
@@ -65,7 +73,7 @@ redeploy to enable live internet probing.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,spark]"
 ruff check services tests
 pytest -v
 ```

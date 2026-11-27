@@ -4,6 +4,7 @@ import json
 import socket
 import ssl
 from datetime import UTC, datetime
+from typing import Any
 
 import dns.asyncresolver
 import dns.exception
@@ -11,6 +12,7 @@ import dns.resolver
 import httpx
 import redis.asyncio as redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.structs import OffsetAndMetadata
 from cryptography import x509
 from shared.config import PlatformConfig
 from shared.models import DiscoveryTask, RawEnvelope, make_deterministic_id, utc_now_iso
@@ -191,7 +193,44 @@ class NetworkProbeEngine:
         )
 
 
+async def process_single_message(
+    message: Any,
+    engine: NetworkProbeEngine,
+    http_client: httpx.AsyncClient,
+    producer: AIOKafkaProducer,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    async with semaphore:
+        try:
+            task = DiscoveryTask.model_validate_json(message.value)
+            dns_envelope = await engine.run_dns_probe(task)
+            key = f"{task.tenant_id}:{task.fqdn}".encode()
+            await producer.send_and_wait(
+                cfg.topic_raw,
+                value=dns_envelope.model_dump_json().encode(),
+                key=key,
+            )
+            if dns_envelope.payload.get("a_records"):
+                tls_envelope = await engine.run_tls_http_probe(http_client, task)
+                await producer.send_and_wait(
+                    cfg.topic_raw,
+                    value=tls_envelope.model_dump_json().encode(),
+                    key=key,
+                )
+        except Exception as error:  # noqa: BLE001 - every failed record must reach the DLQ
+            dlq_payload = json.dumps(
+                {
+                    "error": str(error),
+                    "raw_message": message.value.decode("utf-8", errors="replace"),
+                    "failed_at": utc_now_iso(),
+                }
+            ).encode()
+            await producer.send_and_wait(cfg.topic_dlq, value=dlq_payload)
+
+
 async def consume_forever() -> None:
+    if cfg.probe_concurrency <= 0:
+        raise ValueError("PROBE_CONCURRENCY must be positive")
     redis_client = redis.from_url(cfg.redis_url, decode_responses=True)
     engine = NetworkProbeEngine(
         DistributedTokenBucket(redis_client, "dns_global", cfg.dns_rate_per_sec, cfg.dns_burst)
@@ -209,34 +248,33 @@ async def consume_forever() -> None:
     print("[probe-worker] Connected to broker and consuming tasks", flush=True)
     try:
         async with httpx.AsyncClient(verify=False) as http_client:
-            async for message in consumer:
-                try:
-                    task = DiscoveryTask.model_validate_json(message.value)
-                    dns_envelope = await engine.run_dns_probe(task)
-                    key = f"{task.tenant_id}:{task.fqdn}".encode()
-                    await producer.send_and_wait(
-                        cfg.topic_raw,
-                        value=dns_envelope.model_dump_json().encode(),
-                        key=key,
+            semaphore = asyncio.Semaphore(cfg.probe_concurrency)
+            while True:
+                batches = await consumer.getmany(
+                    timeout_ms=1000,
+                    max_records=max(1, cfg.probe_concurrency * 4),
+                )
+                if not batches:
+                    continue
+                messages = [
+                    message
+                    for partition_messages in batches.values()
+                    for message in partition_messages
+                ]
+                await asyncio.gather(
+                    *[
+                        process_single_message(message, engine, http_client, producer, semaphore)
+                        for message in messages
+                    ]
+                )
+                offsets = {
+                    partition: OffsetAndMetadata(
+                        max(message.offset for message in partition_messages) + 1,
+                        "",
                     )
-                    if dns_envelope.payload.get("a_records"):
-                        tls_envelope = await engine.run_tls_http_probe(http_client, task)
-                        await producer.send_and_wait(
-                            cfg.topic_raw,
-                            value=tls_envelope.model_dump_json().encode(),
-                            key=key,
-                        )
-                    await consumer.commit()
-                except (OSError, ValueError, RuntimeError) as error:
-                    dlq_payload = json.dumps(
-                        {
-                            "error": str(error),
-                            "raw_message": message.value.decode("utf-8", errors="replace"),
-                            "failed_at": utc_now_iso(),
-                        }
-                    ).encode()
-                    await producer.send_and_wait(cfg.topic_dlq, value=dlq_payload)
-                    await consumer.commit()
+                    for partition, partition_messages in batches.items()
+                }
+                await consumer.commit(offsets=offsets)
     finally:
         await consumer.stop()
         await producer.stop()

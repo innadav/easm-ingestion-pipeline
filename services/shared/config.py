@@ -24,5 +24,6 @@ class PlatformConfig:
     ct_burst: int = int(os.getenv("CT_BURST", "5"))
     dns_rate_per_sec: float = float(os.getenv("DNS_RATE_PER_SEC", "25.0"))
     dns_burst: int = int(os.getenv("DNS_BURST", "50"))
+    probe_concurrency: int = int(os.getenv("PROBE_CONCURRENCY", "8"))
     dns_nameservers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     offline_mode: bool = os.getenv("OFFLINE_MODE", "true").lower() == "true"
