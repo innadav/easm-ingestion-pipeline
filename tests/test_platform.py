@@ -6,6 +6,13 @@ from discovery_scheduler import app as scheduler
 from probe_worker.worker import NetworkProbeEngine
 from pydantic import ValidationError
 from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    ArrayType,
+    BooleanType,
+    StringType,
+    StructField,
+    StructType,
+)
 from shared.models import DiscoveryTask
 
 
@@ -149,16 +156,18 @@ def test_graph_clustering_prunes_shared_cdn_hubs(
             "2026-11-27T10:00:00Z",
         ),
     ]
-    columns = [
-        "tenant_id",
-        "fqdn",
-        "a_records",
-        "cname_chain",
-        "cert_sha256",
-        "is_shared_cdn",
-        "observed_at",
-    ]
-    silver_df = spark.createDataFrame(rows, columns)
+    schema = StructType(
+        [
+            StructField("tenant_id", StringType(), False),
+            StructField("fqdn", StringType(), False),
+            StructField("a_records", ArrayType(StringType()), False),
+            StructField("cname_chain", ArrayType(StringType()), False),
+            StructField("cert_sha256", StringType(), True),
+            StructField("is_shared_cdn", BooleanType(), False),
+            StructField("observed_at", StringType(), False),
+        ]
+    )
+    silver_df = spark.createDataFrame(rows, schema)
     clusters = {
         row["fqdn"]: (row["cluster_id"], row["root_cause_node"])
         for row in resolve_clusters_and_root_causes(
