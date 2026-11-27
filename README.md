@@ -1,50 +1,83 @@
-# EASM Ingestion & Entity Resolution Pipeline
+# Real-Time EASM Ingestion Platform
 
-An asynchronous External Attack Surface Management (EASM) collection and normalization
-pipeline in Python. It harvests internet-facing signals from passive and active sources,
-enforces ingestion resilience, and resolves noisy network observations into canonical
-entities with temporal state tracking.
+An event-driven External Attack Surface Management (EASM) platform. It decouples
+discovery, network probing, lakehouse processing, and operational serving across
+containerized services backed by Redpanda, Redis, Delta Lake, and PostgreSQL.
 
 ## Architecture
 
-1. **Ingestion and resilience** — Per-provider async token-bucket rate limiting,
-   full-jitter exponential backoff with `Retry-After` support, durable SQLite
-   checkpoints, and event idempotency.
-2. **Multi-protocol reconnaissance** — Certificate Transparency discovery, concurrent
-   DNS probing with wildcard filtering and CNAME checks, and SNI-aware TLS/HTTP
-   inspection.
-3. **Medallion storage** — Append-only Bronze JSONL, Pydantic-validated Silver JSONL
-   with a fail-loud dead-letter threshold, and SQLite Gold state with SCD Type 2
-   exposure history.
+1. **Discovery scheduler** exposes `POST /scans`, polls Certificate Transparency,
+   stores durable Redis watermarks, and publishes deduplicated scan tasks.
+2. **Probe workers** consume tasks as a Kafka consumer group, coordinate quotas
+   through a Redis Lua token bucket, execute DNS/TLS/HTTP probes, and emit raw
+   envelopes plus dead-letter records.
+3. **Spark Structured Streaming** routes malformed events to the DLQ, appends
+   immutable Bronze records, normalizes Silver observations, maintains Delta Gold
+   state with SCD Type 2 history, and upserts PostgreSQL.
+4. **Asset API** serves tenant inventories and risk filters from PostgreSQL.
 
-## Quickstart
+Topics:
+
+| Topic | Producer | Consumer | Key |
+| --- | --- | --- | --- |
+| `easm.discovery.tasks` | Discovery scheduler | Probe workers | `tenant_id:fqdn` |
+| `easm.raw.observations` | Probe workers | Spark processor | `tenant_id:fqdn` |
+| `easm.dlq.errors` | Workers / Spark | Monitoring / replay | Event key |
+
+## Local Kubernetes
+
+Requires Docker, kind, and kubectl.
+
+```bash
+make up
+kubectl get pods -n easm -w
+```
+
+Trigger a deterministic offline scan:
+
+```bash
+kubectl port-forward -n easm svc/discovery-scheduler 8000:8000
+curl -X POST http://localhost:8000/scans \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"tenant_beta","root_domain":"corp-example.io"}'
+```
+
+Read operational state:
+
+```bash
+kubectl port-forward -n easm svc/asset-api 8080:8080
+curl "http://localhost:8080/tenants/tenant_beta/assets?status=exposed"
+```
+
+Inspect streaming data and stop the cluster:
+
+```bash
+kubectl exec -n easm deploy/redpanda -- \
+  rpk topic describe easm.raw.observations
+make down
+```
+
+Set `OFFLINE_MODE` to `"false"` in [k8s/02-apps.yaml](k8s/02-apps.yaml) and
+redeploy to enable live internet probing.
+
+## Development
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-
-# Deterministic demo without external network access
-easm-collect --offline
-
-# Live discovery
-easm-collect --tenant tenant_acme --domain example.com
-
-# Validation
-ruff check src tests
+ruff check services tests
 pytest -v
 ```
 
-## Container
+## Repository
 
-```bash
-docker build -t easm-ingestion-pipeline .
-docker run --rm easm-ingestion-pipeline
+```text
+services/
+  shared/                 Event contracts, configuration, Redis limiter
+  discovery_scheduler/    CT discovery and task publishing
+  probe_worker/           Kafka consumer and network probe engine
+  spark_processor/        Bronze, Silver, Gold, DLQ, PostgreSQL sync
+  asset_api/              Operational FastAPI service
+k8s/                      Local kind infrastructure and deployments
 ```
-
-## Production Scaling
-
-- Replace in-process `asyncio.gather` fan-out with Kafka or SQS tasks and autoscaled
-  workers backed by a distributed rate limiter.
-- Land the medallion tables in a lakehouse and incrementally sync current Gold state
-  into a query-optimized serving database.

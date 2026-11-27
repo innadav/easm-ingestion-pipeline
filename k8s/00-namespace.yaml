@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: easm
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lakehouse-pvc
+  namespace: easm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

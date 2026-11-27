@@ -1,0 +1,10 @@
+FROM apache/spark:4.0.1-python3
+
+USER root
+COPY services/spark_processor/stream_job.py /opt/spark/work-dir/stream_job.py
+
+RUN /opt/spark/bin/spark-submit \
+    --packages io.delta:delta-spark_2.13:4.0.1,org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.postgresql:postgresql:42.7.4 \
+    --version
+
+USER spark

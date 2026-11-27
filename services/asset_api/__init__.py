@@ -1,0 +1,1 @@
+"""Operational asset API."""
