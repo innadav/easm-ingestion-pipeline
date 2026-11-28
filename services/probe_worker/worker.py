@@ -3,6 +3,7 @@ import hashlib
 import json
 import socket
 import ssl
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -257,7 +258,8 @@ async def process_single_message(
     producer: AIOKafkaProducer,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    async with semaphore, PROBE_DURATION.time():
+    async with semaphore:
+        started = time.monotonic()
         try:
             task = DiscoveryTask.model_validate_json(message.value)
             dns_envelope = await engine.run_dns_probe(task)
@@ -285,6 +287,8 @@ async def process_single_message(
                 }
             ).encode()
             await producer.send_and_wait(cfg.topic_dlq, value=dlq_payload)
+        finally:
+            PROBE_DURATION.observe(time.monotonic() - started)
 
 
 async def consume_forever() -> None:

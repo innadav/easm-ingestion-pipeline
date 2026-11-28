@@ -185,3 +185,23 @@ async def test_tls_probe_refuses_non_public_hosts(monkeypatch) -> None:
     engine = worker.NetworkProbeEngine(None)
     envelope = await engine.run_tls_http_probe(None, make_task("internal.example.com"))
     assert envelope.payload["probe_blocked"] is True
+
+
+async def test_process_single_message_records_metrics_and_publishes() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from probe_worker import worker
+
+    sent: list[str] = []
+
+    class Producer:
+        async def send_and_wait(self, topic: str, **_kwargs) -> None:
+            sent.append(topic)
+
+    message = SimpleNamespace(value=make_task("www.example.com").model_dump_json().encode())
+    engine = worker.NetworkProbeEngine(None)
+    await worker.process_single_message(
+        message, engine, None, Producer(), asyncio.Semaphore(1)
+    )
+    assert sent and worker.cfg.topic_dlq not in sent
