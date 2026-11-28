@@ -51,6 +51,8 @@ ENVELOPE_SCHEMA = StructType(
                     StructField("cert_sans", ArrayType(StringType()), True),
                     StructField("is_expired", BooleanType(), True),
                     StructField("weak_tls", BooleanType(), True),
+                    StructField("cert_untrusted", BooleanType(), True),
+                    StructField("cert_verify_error", StringType(), True),
                 ]
             ),
             False,
@@ -847,7 +849,9 @@ def process_silver_microbatch(silver_df: DataFrame, batch_id: int) -> None:
 
     cached_silver = silver_df.persist()
     try:
-        cached_silver.write.format("delta").mode("append").save(silver_path)
+        cached_silver.write.format("delta").mode("append").option("mergeSchema", "true").save(
+            silver_path
+        )
         aggregated = _aggregate_asset_batch(cached_silver)
         source_states = _source_finding_states(cached_silver)
         findings = _merge_delta_findings(spark, source_states, gold_findings_path)
@@ -910,6 +914,7 @@ def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
                 F.lit("dangling_cname_takeover"),
             )
             .when(F.col("payload.is_expired"), F.lit("expired_tls_certificate"))
+            .when(F.col("payload.cert_untrusted"), F.lit("untrusted_tls_certificate"))
             .when(F.col("payload.weak_tls"), F.lit("deprecated_tls_protocol"))
             .otherwise(F.lit(None).cast("string")),
         )
@@ -919,7 +924,10 @@ def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
                 F.col("payload.is_dangling_cname") | F.col("payload.is_expired"),
                 F.lit("confirmed_exploitable"),
             )
-            .when(F.col("payload.weak_tls"), F.lit("potentially_affected"))
+            .when(
+                F.col("payload.weak_tls") | F.col("payload.cert_untrusted"),
+                F.lit("potentially_affected"),
+            )
             .otherwise(F.lit("informational")),
         )
         .select(
@@ -990,6 +998,7 @@ def main() -> None:
         .writeStream.format("delta")
         .outputMode("append")
         .partitionBy("ingest_date")
+        .option("mergeSchema", "true")
         .option("checkpointLocation", f"{LAKEHOUSE_PATH}/checkpoints/bronze")
         .start(f"{LAKEHOUSE_PATH}/bronze/observations")
     )

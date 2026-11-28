@@ -138,9 +138,15 @@ class NetworkProbeEngine:
 
     @staticmethod
     def _blocking_tls_scan(hostname: str) -> dict:
+        # Permissive context: capture whatever the server presents, including legacy protocols.
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+        try:
+            context.minimum_version = ssl.TLSVersion.TLSv1
+            context.set_ciphers("ALL:@SECLEVEL=0")
+        except (ssl.SSLError, ValueError):
+            pass
         with (
             socket.create_connection((hostname, 443), timeout=4.0) as sock,
             context.wrap_socket(sock, server_hostname=hostname) as tls_sock,
@@ -159,7 +165,25 @@ class NetworkProbeEngine:
             "cert_sans": sans,
             "is_expired": cert.not_valid_after_utc < datetime.now(UTC),
             "weak_tls": tls_version in {"TLSv1", "TLSv1.1", "SSLv3"},
+            **NetworkProbeEngine._verify_certificate(hostname),
         }
+
+    @staticmethod
+    def _verify_certificate(hostname: str) -> dict:
+        """Second, verifying handshake: flags untrusted chains and hostname mismatches."""
+        context = ssl.create_default_context()
+        for attempt in range(3):
+            try:
+                with (
+                    socket.create_connection((hostname, 443), timeout=4.0) as sock,
+                    context.wrap_socket(sock, server_hostname=hostname),
+                ):
+                    return {"cert_untrusted": False}
+            except ssl.SSLCertVerificationError as error:
+                return {"cert_untrusted": True, "cert_verify_error": error.verify_message}
+            except (OSError, ssl.SSLError):
+                time.sleep(0.5 * (attempt + 1))
+        return {}
 
     @staticmethod
     async def _safe_get(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
@@ -217,10 +241,14 @@ class NetworkProbeEngine:
                 entity_key=task.fqdn,
                 payload={"fqdn": task.fqdn, "http_status": None, "probe_blocked": True},
             )
-        try:
-            tls_info = await asyncio.to_thread(self._blocking_tls_scan, task.fqdn)
-        except (OSError, ssl.SSLError, ValueError) as error:
-            tls_info = {"tls_error": type(error).__name__}
+        tls_info: dict = {}
+        for attempt in range(3):
+            try:
+                tls_info = await asyncio.to_thread(self._blocking_tls_scan, task.fqdn)
+                break
+            except (OSError, ssl.SSLError, ValueError) as error:
+                tls_info = {"tls_error": type(error).__name__}
+                await asyncio.sleep(0.5 * (attempt + 1))
         is_shared_cdn = len(tls_info.get("cert_sans", [])) > 50
         technologies: list[str] = []
         http_status = None
