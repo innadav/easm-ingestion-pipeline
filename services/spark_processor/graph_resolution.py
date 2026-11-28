@@ -106,9 +106,13 @@ def resolve_clusters_and_root_causes(
     destination_degree = non_shared.groupBy("tenant_id", "dst_node").agg(
         F.countDistinct("src_node").alias("in_degree")
     )
+    outgoing_degree = non_shared.groupBy("tenant_id", "src_node").agg(
+        F.countDistinct("dst_node").alias("out_degree")
+    )
     clean_edges = (
         non_shared.join(destination_degree, on=["tenant_id", "dst_node"], how="inner")
-        .filter(F.col("in_degree") <= max_hub_degree)
+        .join(outgoing_degree, on=["tenant_id", "src_node"], how="inner")
+        .filter((F.col("in_degree") <= max_hub_degree) & (F.col("out_degree") <= max_hub_degree))
         .select("tenant_id", "src_node", "relation", "dst_node")
     )
 

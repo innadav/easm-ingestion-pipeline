@@ -1,7 +1,11 @@
 FROM apache/spark:4.0.1-python3
 
 USER root
-RUN python3 -m pip install --no-cache-dir "pandas>=2.2,<4" "pyarrow>=17" \
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "delta-spark==4.0.1" \
+    && python3 -m pip install --no-cache-dir \
+    "pandas>=2.2,<4" \
+    "pyarrow>=17" \
     && mkdir -p /opt/spark/.ivy2 \
     && chown -R 185:185 /opt/spark/.ivy2 /opt/spark/work-dir
 COPY --chown=185:185 services/spark_processor /opt/spark/work-dir/spark_processor

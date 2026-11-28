@@ -107,27 +107,25 @@ def _aggregate_asset_batch(silver_df: DataFrame) -> DataFrame:
 
 
 def _source_finding_states(silver_df: DataFrame) -> DataFrame:
-    return (
-        silver_df.groupBy("asset_id", "tenant_id", "fqdn", "source")
-        .agg(
-            F.max(F.when(F.col("exposure_type").isNotNull(), True).otherwise(False)).alias(
-                "has_finding"
-            ),
-            F.max(
-                F.when(F.col("validation_tier") == "confirmed_exploitable", 2)
-                .when(F.col("validation_tier") == "potentially_affected", 1)
-                .otherwise(0)
-            ).alias("validation_tier_rank"),
-            F.max("exposure_type").alias("exposure_type"),
-            F.max("observed_at").alias("detected_at"),
-        )
-        .withColumn(
-            "validation_tier",
-            F.when(F.col("validation_tier_rank") == 2, "confirmed_exploitable")
-            .when(F.col("validation_tier_rank") == 1, "potentially_affected")
-            .otherwise("informational"),
-        )
+    latest = silver_df.groupBy("asset_id", "tenant_id", "fqdn", "source").agg(
+        F.max(
+            F.struct(
+                F.col("observed_at"),
+                F.col("event_id"),
+                F.col("exposure_type"),
+                F.col("validation_tier"),
+            )
+        ).alias("latest_observation")
     )
+    return latest.select(
+        "asset_id",
+        "tenant_id",
+        "fqdn",
+        "source",
+        F.col("latest_observation.observed_at").alias("detected_at"),
+        F.col("latest_observation.exposure_type").alias("exposure_type"),
+        F.col("latest_observation.validation_tier").alias("validation_tier"),
+    ).withColumn("has_finding", F.col("exposure_type").isNotNull())
 
 
 def _merge_delta_findings(
@@ -332,6 +330,94 @@ def _upsert_delta_edges(spark: SparkSession, edges: DataFrame, edges_path: str) 
     )
 
 
+def _classify_accumulated_edges(
+    spark: SparkSession,
+    aggregated: DataFrame,
+    touched_tenants: DataFrame,
+    edges_path: str,
+    gold_assets_path: str,
+) -> DataFrame:
+    asset_states = aggregated.select("tenant_id", "fqdn", "is_shared_cdn")
+    if DeltaTable.isDeltaTable(spark, gold_assets_path):
+        asset_states = asset_states.unionByName(
+            spark.read.format("delta")
+            .load(gold_assets_path)
+            .select("tenant_id", "fqdn", "is_shared_cdn")
+        )
+    asset_states = (
+        asset_states.join(touched_tenants, on="tenant_id", how="inner")
+        .groupBy("tenant_id", "fqdn")
+        .agg(F.max("is_shared_cdn").alias("is_shared_cdn"))
+    )
+    shared_fqdns = (
+        asset_states.filter(F.col("is_shared_cdn"))
+        .select(
+            "tenant_id",
+            F.concat(F.lit("fqdn:"), F.col("fqdn")).alias("node"),
+        )
+        .distinct()
+    )
+    tenant_edges = (
+        spark.read.format("delta")
+        .load(edges_path)
+        .join(touched_tenants, on="tenant_id", how="inner")
+    )
+    shared_certificates = (
+        tenant_edges.alias("edge")
+        .filter(F.col("edge.relation") == "PRESENTS_CERT")
+        .join(
+            shared_fqdns.alias("shared"),
+            (F.col("edge.tenant_id") == F.col("shared.tenant_id"))
+            & (F.col("edge.src_node") == F.col("shared.node")),
+            how="inner",
+        )
+        .select(
+            F.col("edge.tenant_id").alias("tenant_id"),
+            F.col("edge.dst_node").alias("node"),
+        )
+        .distinct()
+    )
+    shared_nodes = shared_fqdns.unionByName(shared_certificates)
+    classified = (
+        tenant_edges.alias("edge")
+        .join(
+            shared_nodes.alias("source_state"),
+            (F.col("edge.tenant_id") == F.col("source_state.tenant_id"))
+            & (F.col("edge.src_node") == F.col("source_state.node")),
+            how="left",
+        )
+        .join(
+            shared_nodes.alias("destination_state"),
+            (F.col("edge.tenant_id") == F.col("destination_state.tenant_id"))
+            & (F.col("edge.dst_node") == F.col("destination_state.node")),
+            how="left",
+        )
+        .select(
+            "edge.*",
+            F.col("source_state.node").alias("shared_source"),
+            F.col("destination_state.node").alias("shared_destination"),
+        )
+        .withColumn(
+            "is_shared_infra",
+            F.col("is_shared_infra")
+            | F.col("shared_source").isNotNull()
+            | F.col("shared_destination").isNotNull(),
+        )
+        .drop("shared_source", "shared_destination")
+    )
+    (
+        DeltaTable.forPath(spark, edges_path)
+        .alias("target")
+        .merge(
+            classified.alias("source"),
+            "target.tenant_id = source.tenant_id AND target.edge_id = source.edge_id",
+        )
+        .whenMatchedUpdate(set={"is_shared_infra": F.col("source.is_shared_infra")})
+        .execute()
+    )
+    return classified
+
+
 def _sync_delta_clusters(
     spark: SparkSession,
     clusters: DataFrame,
@@ -428,8 +514,19 @@ def _append_state_changes(spark: SparkSession, aggregated: DataFrame, history_pa
     changes.write.format("delta").mode("append").save(history_path)
 
 
+def _open_postgres_connection(spark: SparkSession):
+    jvm = spark._jvm
+    loader = jvm.java.lang.Thread.currentThread().getContextClassLoader()
+    driver_class = jvm.java.lang.Class.forName("org.postgresql.Driver", True, loader)
+    driver = driver_class.newInstance()
+    properties = jvm.java.util.Properties()
+    properties.setProperty("user", PG_USER)
+    properties.setProperty("password", PG_PASSWORD)
+    return driver.connect(PG_JDBC_URL, properties)
+
+
 def _prepare_postgres_tables(spark: SparkSession) -> None:
-    connection = spark._jvm.java.sql.DriverManager.getConnection(PG_JDBC_URL, PG_USER, PG_PASSWORD)
+    connection = _open_postgres_connection(spark)
     try:
         statement = connection.createStatement()
         try:
@@ -473,6 +570,7 @@ def _sync_postgres(
     source_states: DataFrame,
     edges: DataFrame,
     cluster_assignments: DataFrame,
+    replace_projection: bool = False,
 ) -> None:
     _prepare_postgres_tables(spark)
     frames = (
@@ -537,11 +635,13 @@ def _sync_postgres(
             .save()
         )
 
-    connection = spark._jvm.java.sql.DriverManager.getConnection(PG_JDBC_URL, PG_USER, PG_PASSWORD)
+    connection = _open_postgres_connection(spark)
     connection.setAutoCommit(False)
     try:
         statement = connection.createStatement()
         try:
+            if replace_projection:
+                statement.execute("TRUNCATE gold_asset_findings, gold_asset_edges")
             statement.execute(
                 """
                 DELETE FROM gold_asset_findings existing
@@ -672,6 +772,69 @@ def _sync_postgres(
         connection.close()
 
 
+def _recover_postgres_projection(spark: SparkSession) -> None:
+    gold_assets_path = f"{LAKEHOUSE_PATH}/gold/assets"
+    if not DeltaTable.isDeltaTable(spark, gold_assets_path):
+        return
+
+    aggregated = spark.read.format("delta").load(gold_assets_path)
+    clusters = aggregated.select(
+        "asset_id",
+        "tenant_id",
+        "fqdn",
+        "cluster_id",
+        "root_cause_node",
+    )
+    findings_path = f"{LAKEHOUSE_PATH}/gold/findings"
+    if DeltaTable.isDeltaTable(spark, findings_path):
+        source_states = (
+            spark.read.format("delta")
+            .load(findings_path)
+            .select(
+                "asset_id",
+                "tenant_id",
+                "source",
+                "exposure_type",
+                "validation_tier",
+                "detected_at",
+            )
+            .withColumn("has_finding", F.lit(True))
+        )
+    else:
+        source_states = (
+            aggregated.limit(0)
+            .select("asset_id", "tenant_id")
+            .withColumn("source", F.lit(None).cast("string"))
+            .withColumn("exposure_type", F.lit(None).cast("string"))
+            .withColumn("validation_tier", F.lit(None).cast("string"))
+            .withColumn("detected_at", F.lit(None).cast("string"))
+            .withColumn("has_finding", F.lit(False))
+        )
+
+    edges_path = f"{LAKEHOUSE_PATH}/gold/infrastructure_edges"
+    if DeltaTable.isDeltaTable(spark, edges_path):
+        edges = spark.read.format("delta").load(edges_path)
+    else:
+        edges = (
+            aggregated.limit(0)
+            .select("tenant_id")
+            .withColumn("edge_id", F.lit(None).cast("string"))
+            .withColumn("src_node", F.lit(None).cast("string"))
+            .withColumn("relation", F.lit(None).cast("string"))
+            .withColumn("dst_node", F.lit(None).cast("string"))
+            .withColumn("is_shared_infra", F.lit(False))
+            .withColumn("observed_at", F.lit(None).cast("string"))
+        )
+    _sync_postgres(
+        spark,
+        aggregated,
+        source_states,
+        edges,
+        clusters,
+        replace_projection=True,
+    )
+
+
 def process_silver_microbatch(silver_df: DataFrame, batch_id: int) -> None:
     if silver_df.isEmpty():
         return
@@ -693,10 +856,12 @@ def process_silver_microbatch(silver_df: DataFrame, batch_id: int) -> None:
         batch_edges = extract_infrastructure_edges(cached_silver)
         _upsert_delta_edges(spark, batch_edges, gold_edges_path)
         touched_tenants = cached_silver.select("tenant_id").distinct()
-        tenant_edges = (
-            spark.read.format("delta")
-            .load(gold_edges_path)
-            .join(touched_tenants, on="tenant_id", how="inner")
+        tenant_edges = _classify_accumulated_edges(
+            spark,
+            aggregated,
+            touched_tenants,
+            gold_edges_path,
+            gold_assets_path,
         )
         clusters = resolve_clusters_and_root_causes(tenant_edges)
         aggregated = _merge_graph_attributes(aggregated, clusters)
@@ -709,7 +874,7 @@ def process_silver_microbatch(silver_df: DataFrame, batch_id: int) -> None:
             spark,
             aggregated,
             source_states,
-            batch_edges,
+            tenant_edges,
             cluster_assignments,
         )
         spark.sparkContext.setJobDescription(f"EASM micro-batch {batch_id} complete")
@@ -780,6 +945,7 @@ def _silver_stream(valid_envelopes: DataFrame) -> DataFrame:
 def main() -> None:
     spark = build_spark_session()
     spark.sparkContext.setLogLevel("WARN")
+    _recover_postgres_projection(spark)
     raw_kafka = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BROKERS)

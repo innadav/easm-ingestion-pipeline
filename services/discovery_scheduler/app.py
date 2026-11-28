@@ -43,22 +43,11 @@ async def schedule_domain_discovery(tenant_id: str, root_domain: str) -> int:
     if cfg.offline_mode:
         records = synthetic_ct_records(last_id, normalized_domain)
     else:
-        await ct_limiter.acquire()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                response = await client.get(
-                    "https://crt.sh/",
-                    params={"q": f"%.{normalized_domain}", "output": "json"},
-                )
-                response.raise_for_status()
-                records = response.json()
-            except (httpx.HTTPError, ValueError):
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                records = synthetic_ct_records(last_id, normalized_domain)
+        records = await _fetch_live_ct_records(normalized_domain)
 
     fqdns: set[str] = {normalized_domain}
     max_id = last_id
-    for row in records[:100]:
+    for row in sorted(records, key=lambda record: int(record.get("id", 0))):
         ct_id = int(row.get("id", 0))
         if ct_id <= last_id:
             continue
@@ -96,6 +85,30 @@ async def schedule_domain_discovery(tenant_id: str, root_domain: str) -> int:
     if max_id > last_id:
         await redis_client.set(checkpoint_key, str(max_id))
     return published
+
+
+async def _fetch_live_ct_records(root_domain: str) -> list[dict]:
+    if ct_limiter is None:
+        raise RuntimeError("CT rate limiter is not initialized")
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(3):
+            await ct_limiter.acquire()
+            try:
+                response = await client.get(
+                    "https://crt.sh/",
+                    params={"q": f"%.{root_domain}", "output": "json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, list):
+                    raise TypeError("crt.sh response must be a JSON array")
+                return payload
+            except (httpx.HTTPError, TypeError, ValueError) as error:
+                last_error = error
+                if attempt < 2:
+                    await asyncio.sleep(random.uniform(0.5, 1.5) * (2**attempt))
+    raise RuntimeError("Certificate Transparency discovery failed") from last_error
 
 
 async def periodic_scheduler_loop() -> None:

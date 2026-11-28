@@ -18,7 +18,7 @@ jobs:
       - name: Lint with Ruff
         run: ruff check services tests
       - name: Run service tests
-        run: pytest -v tests/test_platform.py
+        run: pytest -v tests/test_platform.py tests/test_manifests.py
 
   spark-test:
     runs-on: ubuntu-latest

@@ -15,6 +15,7 @@ from spark_processor.graph_resolution import (
     extract_infrastructure_edges,
     resolve_clusters_and_root_causes,
 )
+from spark_processor.stream_job import _source_finding_states
 
 
 @pytest.fixture(scope="session")
@@ -91,3 +92,85 @@ def test_graph_clustering_prunes_shared_cdn_hubs(spark: SparkSession) -> None:
     assert clusters["app1.acme.com"][0] == clusters["app2.acme.com"][0]
     assert clusters["app1.acme.com"][1] == "fqdn:internal-alb.elb.amazonaws.com"
     assert "www.acme.com" not in clusters
+
+
+def test_latest_source_observation_controls_finding_state(
+    spark: SparkSession,
+) -> None:
+    rows = [
+        (
+            "event-old",
+            "asset-1",
+            "t1",
+            "app.acme.com",
+            "dns_probe",
+            "dangling_cname_takeover",
+            "confirmed_exploitable",
+            "2026-11-28T10:00:00Z",
+        ),
+        (
+            "event-new",
+            "asset-1",
+            "t1",
+            "app.acme.com",
+            "dns_probe",
+            None,
+            "informational",
+            "2026-11-28T10:00:05Z",
+        ),
+    ]
+    schema = StructType(
+        [
+            StructField("event_id", StringType(), False),
+            StructField("asset_id", StringType(), False),
+            StructField("tenant_id", StringType(), False),
+            StructField("fqdn", StringType(), False),
+            StructField("source", StringType(), False),
+            StructField("exposure_type", StringType(), True),
+            StructField("validation_tier", StringType(), False),
+            StructField("observed_at", StringType(), False),
+        ]
+    )
+    state = _source_finding_states(spark.createDataFrame(rows, schema)).collect()[0]
+
+    assert state["has_finding"] is False
+    assert state["exposure_type"] is None
+    assert state["validation_tier"] == "informational"
+
+
+def test_certificate_san_fanout_is_pruned(
+    spark: SparkSession,
+) -> None:
+    sans = [f"app-{index}.acme.com" for index in range(26)]
+    schema = StructType(
+        [
+            StructField("tenant_id", StringType(), False),
+            StructField("fqdn", StringType(), False),
+            StructField("a_records", ArrayType(StringType()), False),
+            StructField("cname_chain", ArrayType(StringType()), False),
+            StructField("cert_sha256", StringType(), True),
+            StructField("cert_sans", ArrayType(StringType()), False),
+            StructField("is_shared_cdn", BooleanType(), False),
+            StructField("observed_at", StringType(), False),
+        ]
+    )
+    silver = spark.createDataFrame(
+        [
+            (
+                "t1",
+                "issuer.acme.com",
+                [],
+                [],
+                "large-cert",
+                sans,
+                False,
+                "2026-11-28T10:00:00Z",
+            )
+        ],
+        schema,
+    )
+
+    clusters = resolve_clusters_and_root_causes(extract_infrastructure_edges(silver))
+    fqdns = {row["fqdn"] for row in clusters.collect()}
+    assert fqdns == {"issuer.acme.com"}
+    assert not fqdns.intersection(sans)

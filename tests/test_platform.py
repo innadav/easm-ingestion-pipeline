@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from discovery_scheduler import app as scheduler
 from probe_worker.worker import NetworkProbeEngine
@@ -67,6 +69,54 @@ async def test_scheduler_publishes_each_fqdn_once(
     assert second_count == 0
     assert len(fake_producer.messages) == 4
     assert all(topic == scheduler.cfg.topic_tasks for topic, _, _ in fake_producer.messages)
+
+
+async def test_live_ct_failure_does_not_publish_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_redis = FakeRedis()
+    fake_producer = FakeProducer()
+    monkeypatch.setattr(scheduler, "cfg", replace(scheduler.cfg, offline_mode=False))
+    monkeypatch.setattr(scheduler, "redis_client", fake_redis)
+    monkeypatch.setattr(scheduler, "producer", fake_producer)
+    monkeypatch.setattr(scheduler, "ct_limiter", NoopLimiter())
+
+    async def fail_ct(_: str) -> list[dict]:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(scheduler, "_fetch_live_ct_records", fail_ct)
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await scheduler.schedule_domain_discovery("tenant-a", "example.com")
+
+    assert fake_producer.messages == []
+    assert "easm:checkpoint:ct:tenant-a:example.com" not in fake_redis.values
+
+
+async def test_scheduler_processes_complete_ct_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_redis = FakeRedis()
+    fake_producer = FakeProducer()
+    monkeypatch.setattr(scheduler, "redis_client", fake_redis)
+    monkeypatch.setattr(scheduler, "producer", fake_producer)
+    monkeypatch.setattr(scheduler, "ct_limiter", NoopLimiter())
+    monkeypatch.setattr(
+        scheduler,
+        "synthetic_ct_records",
+        lambda _last_id, root_domain: [
+            {
+                "id": index,
+                "name_value": f"host-{index}.{root_domain}",
+            }
+            for index in range(1, 102)
+        ],
+    )
+
+    published = await scheduler.schedule_domain_discovery("tenant-a", "example.com")
+
+    assert published == 102
+    assert len(fake_producer.messages) == 102
+    assert fake_redis.values["easm:checkpoint:ct:tenant-a:example.com"] == "101"
 
 
 async def test_offline_dns_probe_flags_dangling_cname() -> None:
