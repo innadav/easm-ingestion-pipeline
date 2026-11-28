@@ -8,9 +8,11 @@ import redis.asyncio as redis
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaError
 from fastapi import FastAPI
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 from shared.config import PlatformConfig
+from shared.metrics import SCANS_REQUESTED, TASKS_PUBLISHED
 from shared.models import DiscoveryTask, make_deterministic_id
 from shared.redis_limiter import DistributedTokenBucket
 
@@ -81,6 +83,7 @@ async def schedule_domain_discovery(tenant_id: str, root_domain: str) -> int:
             await redis_client.delete(dedup_key)
             raise
         published += 1
+        TASKS_PUBLISHED.inc()
 
     if max_id > last_id:
         await redis_client.set(checkpoint_key, str(max_id))
@@ -137,6 +140,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="EASM Discovery Scheduler", lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
 
 
 @app.get("/healthz")
@@ -146,6 +150,7 @@ async def healthz() -> dict[str, str]:
 
 @app.post("/scans")
 async def trigger_scan(request: ScanRequest) -> dict:
+    SCANS_REQUESTED.inc()
     enqueued = await schedule_domain_discovery(request.tenant_id, request.root_domain)
     return {
         "tenant_id": request.tenant_id,

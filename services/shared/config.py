@@ -26,4 +26,7 @@ class PlatformConfig:
     dns_burst: int = int(os.getenv("DNS_BURST", "50"))
     probe_concurrency: int = int(os.getenv("PROBE_CONCURRENCY", "8"))
     dns_nameservers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
+    metrics_port: int = int(os.getenv("METRICS_PORT", "9108"))
+    observability_mode: str = os.getenv("OBSERVABILITY_MODE", "debug")
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
     offline_mode: bool = os.getenv("OFFLINE_MODE", "true").lower() == "true"

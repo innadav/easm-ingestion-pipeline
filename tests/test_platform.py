@@ -137,3 +137,51 @@ async def test_offline_tls_probe_marks_shared_cdn() -> None:
     assert envelope.source == "tls_http_probe"
     assert envelope.payload["is_shared_cdn"] is True
     assert envelope.payload["tls_version"] == "TLSv1.3"
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("93.184.216.34", True),
+        ("10.0.0.5", False),
+        ("127.0.0.1", False),
+        ("169.254.169.254", False),
+        ("::1", False),
+        ("not-an-ip", False),
+    ],
+)
+def test_is_public_ip(address: str, expected: bool) -> None:
+    from shared.netguard import is_public_ip
+
+    assert is_public_ip(address) is expected
+
+
+async def test_dns_servfail_is_not_reported_as_empty_answer(monkeypatch) -> None:
+    import dns.resolver
+    from probe_worker import worker
+
+    class Limiter:
+        async def acquire(self) -> None:
+            return None
+
+    async def fail(*_args, **_kwargs):
+        raise dns.resolver.NoNameservers()
+
+    monkeypatch.setattr(worker, "cfg", replace(worker.cfg, offline_mode=False))
+    engine = worker.NetworkProbeEngine(Limiter())
+    monkeypatch.setattr(engine.resolver, "resolve", fail)
+    with pytest.raises(worker.ProbeUnavailableError):
+        await engine.run_dns_probe(make_task("www.example.com"))
+
+
+async def test_tls_probe_refuses_non_public_hosts(monkeypatch) -> None:
+    from probe_worker import worker
+
+    async def private(_host: str) -> bool:
+        return False
+
+    monkeypatch.setattr(worker, "cfg", replace(worker.cfg, offline_mode=False))
+    monkeypatch.setattr(worker, "host_is_public", private)
+    engine = worker.NetworkProbeEngine(None)
+    envelope = await engine.run_tls_http_probe(None, make_task("internal.example.com"))
+    assert envelope.payload["probe_blocked"] is True

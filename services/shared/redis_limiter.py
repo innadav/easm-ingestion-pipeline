@@ -3,6 +3,8 @@ import time
 
 import redis.asyncio as redis
 
+from shared.metrics import RATE_LIMIT_WAIT
+
 _TOKEN_BUCKET_LUA = """
 local key = KEYS[1]
 local rate = tonumber(ARGV[1])
@@ -42,12 +44,14 @@ class DistributedTokenBucket:
     ):
         if rate_per_sec <= 0 or capacity <= 0:
             raise ValueError("Rate and capacity must be positive")
+        self.bucket_name = bucket_name
         self.key = f"easm:ratelimit:{bucket_name}"
         self.rate = rate_per_sec
         self.capacity = capacity
         self._script = client.register_script(_TOKEN_BUCKET_LUA)
 
     async def acquire(self) -> None:
+        started = time.monotonic()
         while True:
             wait_ms = int(
                 await self._script(
@@ -56,5 +60,8 @@ class DistributedTokenBucket:
                 )
             )
             if wait_ms <= 0:
+                RATE_LIMIT_WAIT.labels(bucket=self.bucket_name).observe(
+                    time.monotonic() - started
+                )
                 return
             await asyncio.sleep(wait_ms / 1000.0)

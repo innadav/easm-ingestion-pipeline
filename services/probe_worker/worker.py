@@ -15,10 +15,25 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import OffsetAndMetadata
 from cryptography import x509
 from shared.config import PlatformConfig
+from shared.metrics import (
+    DNS_QUERIES,
+    PROBE_DURATION,
+    PROBES_BLOCKED,
+    PROBES_PROCESSED,
+    start_metrics_server,
+)
 from shared.models import DiscoveryTask, RawEnvelope, make_deterministic_id, utc_now_iso
+from shared.netguard import host_is_public
 from shared.redis_limiter import DistributedTokenBucket
 
 cfg = PlatformConfig()
+MAX_REDIRECTS = 3
+MAX_BODY_BYTES = 1_048_576
+UNKNOWN_DNS_STATUSES = {"TIMEOUT", "SERVFAIL", "ERROR"}
+
+
+class ProbeUnavailableError(Exception):
+    """DNS state could not be determined; no observation must be emitted."""
 
 
 class NetworkProbeEngine:
@@ -31,17 +46,23 @@ class NetworkProbeEngine:
 
     async def _dns_query(self, fqdn: str, rdtype: str) -> tuple[list[str], str]:
         await self.dns_limiter.acquire()
+        status = "NOERROR"
+        records: list[str] = []
         try:
             answer = await self.resolver.resolve(fqdn, rdtype)
-            return [record.to_text().strip('"') for record in answer], "NOERROR"
+            records = [record.to_text().strip('"') for record in answer]
         except dns.resolver.NXDOMAIN:
-            return [], "NXDOMAIN"
-        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-            return [], "NOERROR"
+            status = "NXDOMAIN"
+        except dns.resolver.NoAnswer:
+            pass
+        except dns.resolver.NoNameservers:
+            status = "SERVFAIL"
         except dns.exception.Timeout:
-            return [], "TIMEOUT"
+            status = "TIMEOUT"
         except (dns.exception.DNSException, OSError):
-            return [], "ERROR"
+            status = "ERROR"
+        DNS_QUERIES.labels(rdtype=rdtype, status=status).inc()
+        return records, status
 
     async def run_dns_probe(self, task: DiscoveryTask) -> RawEnvelope:
         hour_bucket = datetime.now(UTC).strftime("%Y-%m-%dT%H")
@@ -76,12 +97,16 @@ class NetworkProbeEngine:
                 payload=payload,
             )
 
-        a_records, _ = await self._dns_query(task.fqdn, "A")
+        a_records, a_status = await self._dns_query(task.fqdn, "A")
+        if a_status in UNKNOWN_DNS_STATUSES:
+            raise ProbeUnavailableError(f"DNS {a_status} for {task.fqdn}")
         cname_chain: list[str] = []
         current = task.fqdn
         visited = {current}
         for _ in range(8):
-            cnames, _ = await self._dns_query(current, "CNAME")
+            cnames, cname_status = await self._dns_query(current, "CNAME")
+            if cname_status in UNKNOWN_DNS_STATUSES:
+                raise ProbeUnavailableError(f"DNS {cname_status} for {current}")
             if not cnames:
                 break
             target = cnames[0].rstrip(".")
@@ -94,6 +119,8 @@ class NetworkProbeEngine:
         is_dangling = False
         if cname_chain:
             terminal_ips, terminal_status = await self._dns_query(cname_chain[-1], "A")
+            if terminal_status in UNKNOWN_DNS_STATUSES:
+                raise ProbeUnavailableError(f"DNS {terminal_status} for {cname_chain[-1]}")
             is_dangling = terminal_status == "NXDOMAIN" and not terminal_ips
         return RawEnvelope(
             event_id=event_id,
@@ -133,6 +160,26 @@ class NetworkProbeEngine:
             "weak_tls": tls_version in {"TLSv1", "TLSv1.1", "SSLv3"},
         }
 
+    @staticmethod
+    async def _safe_get(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+        """GET with manual redirects; every hop must resolve to public addresses only."""
+        for _ in range(MAX_REDIRECTS + 1):
+            if not await host_is_public(httpx.URL(url).host):
+                PROBES_BLOCKED.labels(reason="non_public_host").inc()
+                return None
+            async with client.stream("GET", url, follow_redirects=False, timeout=5.0) as response:
+                received = 0
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received >= MAX_BODY_BYTES:
+                        break
+            location = response.headers.get("location")
+            if response.is_redirect and location:
+                url = str(response.url.join(location))
+                continue
+            return response
+        return None
+
     async def run_tls_http_probe(
         self, client: httpx.AsyncClient, task: DiscoveryTask
     ) -> RawEnvelope:
@@ -160,6 +207,15 @@ class NetworkProbeEngine:
                 },
             )
 
+        if not await host_is_public(task.fqdn):
+            PROBES_BLOCKED.labels(reason="non_public_host").inc()
+            return RawEnvelope(
+                event_id=event_id,
+                tenant_id=task.tenant_id,
+                source="tls_http_probe",
+                entity_key=task.fqdn,
+                payload={"fqdn": task.fqdn, "http_status": None, "probe_blocked": True},
+            )
         try:
             tls_info = await asyncio.to_thread(self._blocking_tls_scan, task.fqdn)
         except (OSError, ssl.SSLError, ValueError) as error:
@@ -168,14 +224,15 @@ class NetworkProbeEngine:
         technologies: list[str] = []
         http_status = None
         try:
-            response = await client.get(f"https://{task.fqdn}", follow_redirects=True, timeout=5.0)
-            http_status = response.status_code
-            headers = {key.lower(): value for key, value in response.headers.items()}
-            if "server" in headers:
-                technologies.append(f"server:{headers['server']}")
-            if "cf-ray" in headers or "x-amz-cf-id" in headers:
-                is_shared_cdn = True
-                technologies.append("cdn:edge_proxy")
+            response = await self._safe_get(client, f"https://{task.fqdn}")
+            if response is not None:
+                http_status = response.status_code
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                if "server" in headers:
+                    technologies.append(f"server:{headers['server']}")
+                if "cf-ray" in headers or "x-amz-cf-id" in headers:
+                    is_shared_cdn = True
+                    technologies.append("cdn:edge_proxy")
         except httpx.HTTPError:
             pass
         return RawEnvelope(
@@ -200,7 +257,7 @@ async def process_single_message(
     producer: AIOKafkaProducer,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    async with semaphore:
+    async with semaphore, PROBE_DURATION.time():
         try:
             task = DiscoveryTask.model_validate_json(message.value)
             dns_envelope = await engine.run_dns_probe(task)
@@ -217,7 +274,9 @@ async def process_single_message(
                     value=tls_envelope.model_dump_json().encode(),
                     key=key,
                 )
+            PROBES_PROCESSED.labels(outcome="ok").inc()
         except Exception as error:  # noqa: BLE001 - every failed record must reach the DLQ
+            PROBES_PROCESSED.labels(outcome=type(error).__name__).inc()
             dlq_payload = json.dumps(
                 {
                     "error": str(error),
@@ -231,6 +290,7 @@ async def process_single_message(
 async def consume_forever() -> None:
     if cfg.probe_concurrency <= 0:
         raise ValueError("PROBE_CONCURRENCY must be positive")
+    start_metrics_server(cfg.metrics_port)
     redis_client = redis.from_url(cfg.redis_url, decode_responses=True)
     engine = NetworkProbeEngine(
         DistributedTokenBucket(redis_client, "dns_global", cfg.dns_rate_per_sec, cfg.dns_burst)

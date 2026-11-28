@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  namespace: easm
+  name: probe-worker
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: probe-worker

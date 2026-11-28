@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: easm
+  name: spark-stream-processor
+spec:
+  template:
+    spec:
+      volumes:
+        - name: lakehouse
+          persistentVolumeClaim:
+            claimName: lakehouse-pvc
+      containers:
+        - name: spark-driver
+          volumeMounts:
+            - name: lakehouse
+              mountPath: /mnt/lakehouse

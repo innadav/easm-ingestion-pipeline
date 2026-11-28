@@ -12,11 +12,14 @@ spec:
     metadata:
       labels:
         app: discovery-scheduler
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
     spec:
       containers:
         - name: scheduler
           image: easm-services:local
-          imagePullPolicy: Never
           command:
             - uvicorn
             - discovery_scheduler.app:app
@@ -24,9 +27,9 @@ spec:
             - 0.0.0.0
             - --port
             - "8000"
-          env:
-            - name: OFFLINE_MODE
-              value: "true"
+          envFrom:
+            - configMapRef:
+                name: easm-observability-config
           ports:
             - containerPort: 8000
 ---
@@ -56,17 +59,24 @@ spec:
     metadata:
       labels:
         app: probe-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9108"
+        prometheus.io/path: /metrics
     spec:
       containers:
         - name: worker
           image: easm-services:local
-          imagePullPolicy: Never
           command: ["python", "-m", "probe_worker.worker"]
+          envFrom:
+            - configMapRef:
+                name: easm-observability-config
           env:
-            - name: OFFLINE_MODE
-              value: "true"
             - name: PROBE_CONCURRENCY
               value: "8"
+          ports:
+            - name: metrics
+              containerPort: 9108
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -82,11 +92,14 @@ spec:
     metadata:
       labels:
         app: asset-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       containers:
         - name: api
           image: easm-services:local
-          imagePullPolicy: Never
           command:
             - uvicorn
             - asset_api.app:app
@@ -94,6 +107,9 @@ spec:
             - 0.0.0.0
             - --port
             - "8080"
+          envFrom:
+            - configMapRef:
+                name: easm-observability-config
           ports:
             - containerPort: 8080
 ---
@@ -129,17 +145,12 @@ spec:
       containers:
         - name: spark-driver
           image: easm-spark:local
-          imagePullPolicy: Never
           command:
             - /opt/spark/bin/spark-submit
             - --master=local[2]
             - --conf=spark.jars.ivy=/opt/spark/.ivy2
             - --packages=io.delta:delta-spark_2.13:4.0.1,org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.postgresql:postgresql:42.7.4
             - /opt/spark/work-dir/spark_processor/stream_job.py
-          volumeMounts:
-            - name: lakehouse
-              mountPath: /mnt/lakehouse
-      volumes:
-        - name: lakehouse
-          persistentVolumeClaim:
-            claimName: lakehouse-pvc
+          envFrom:
+            - configMapRef:
+                name: easm-observability-config

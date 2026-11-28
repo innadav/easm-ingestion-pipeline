@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/local-infra
+
+configMapGenerator:
+  - name: easm-observability-config
+    behavior: merge
+    literals:
+      - OBSERVABILITY_MODE=debug
+      - LOG_LEVEL=DEBUG
+      - OFFLINE_MODE=true
+
+patches:
+  - path: patch-local.yaml
+  - target:
+      kind: Deployment
+      name: "discovery-scheduler|probe-worker|asset-api|spark-stream-processor"
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never

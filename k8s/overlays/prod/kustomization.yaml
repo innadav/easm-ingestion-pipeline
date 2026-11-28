@@ -1,0 +1,37 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production uses managed Kafka-compatible, Redis and PostgreSQL services and object storage;
+# no in-cluster infra component is included. Fill in the endpoints below (or patch from
+# External Secrets) before deploying. Spark also needs hadoop-aws jars and S3 Delta settings.
+resources:
+  - ../../base
+  - pdb.yaml
+
+configMapGenerator:
+  - name: easm-observability-config
+    behavior: merge
+    literals:
+      - OBSERVABILITY_MODE=production
+      - LOG_LEVEL=INFO
+      - OFFLINE_MODE=false
+      - LAKEHOUSE_PATH=s3a://easm-prod-lakehouse/medallion
+
+images:
+  - name: easm-services
+    newName: ghcr.io/innadav/easm-services
+    newTag: latest
+  - name: easm-spark
+    newName: ghcr.io/innadav/easm-spark
+    newTag: latest
+
+replicas:
+  - name: discovery-scheduler
+    count: 2
+  - name: probe-worker
+    count: 6
+  - name: asset-api
+    count: 3
+
+patches:
+  - path: patch-prod.yaml

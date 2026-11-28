@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import FastAPI, Query
+from prometheus_client import make_asgi_app
 from shared.config import PlatformConfig
 
 cfg = PlatformConfig()
@@ -68,6 +69,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="EASM Operational Asset API", lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
 
 
 @app.get("/healthz")

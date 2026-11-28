@@ -262,7 +262,7 @@ kubectl exec -n easm deploy/redpanda -- \
 make down
 ```
 
-Set `OFFLINE_MODE` to `"false"` in [k8s/02-apps.yaml](k8s/02-apps.yaml) and
+Set `OFFLINE_MODE` to `"false"` in [k8s/overlays/local/kustomization.yaml](k8s/overlays/local/kustomization.yaml) and
 redeploy to enable live public-internet probing.
 
 ## Development and CI
@@ -302,5 +302,5 @@ services/
 tests/
   test_platform.py        Scheduler and probe behavior
   test_graph_resolution.py Spark graph behavior
-k8s/                      Local kind infrastructure and deployments
+k8s/base, components, overlays  Kustomize base apps, local-infra component, local/prod overlays
 ```
